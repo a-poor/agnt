@@ -8,7 +8,6 @@ import (
 	"os"
 	"path"
 
-	ollama "github.com/ollama/ollama/api"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -29,7 +28,6 @@ const (
 type client struct {
 	dbp string
 	db  *bolt.DB
-	ol  *ollama.Client
 }
 
 func newClient(ctx context.Context, d string) (*client, error) {
@@ -96,17 +94,6 @@ func newClient(ctx context.Context, d string) (*client, error) {
 		return nil, fmt.Errorf("failed to update database: %w", err)
 	}
 
-	// Connect to the ollama client
-	c, err := ollama.ClientFromEnvironment()
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to ollama: %w", err)
-	}
-
-	// Check that ollama is running
-	if err := c.Heartbeat(ctx); err != nil {
-		return nil, fmt.Errorf("ollama is not running: %w", err)
-	}
-
 	// TODO: Set up channels?
 	// ...
 
@@ -114,7 +101,6 @@ func newClient(ctx context.Context, d string) (*client, error) {
 	return &client{
 		dbp: p,
 		db:  db,
-		ol:  c,
 	}, nil
 }
 
@@ -238,31 +224,393 @@ func (m Message) BID() []byte {
 }
 
 // ListMessages retrieves all messages for a specific chat from the database.
-func (c *client) ListMessages() {}
+func (c *client) ListMessages(chatID int) ([]Message, error) {
+	var msgs []Message
+	if err := c.db.View(func(tx *bolt.Tx) error {
+		bucketName := ChatInfo{ID: chatID}.MessageBucketName()
+		bucket := tx.Bucket(bucketName)
+		if bucket == nil {
+			return fmt.Errorf("chat messages bucket not found")
+		}
+
+		cursor := bucket.Cursor()
+		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+			var msg Message
+			if err := json.Unmarshal(v, &msg); err != nil {
+				return fmt.Errorf("failed to unmarshal message: %w", err)
+			}
+			msgs = append(msgs, msg)
+		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("failed to read messages from db: %w", err)
+	}
+	return msgs, nil
+}
 
 // CreateMessage adds a new message to a chat thread in the database.
-func (c *client) CreateMessage(context.Context) {}
+func (c *client) CreateMessage(msg Message) (*Message, error) {
+	if err := c.db.Update(func(tx *bolt.Tx) error {
+		bucketName := ChatInfo{ID: msg.ChatID}.MessageBucketName()
+		bucket := tx.Bucket(bucketName)
+		if bucket == nil {
+			return fmt.Errorf("chat messages bucket not found")
+		}
+
+		// Get next sequence for message ID
+		id, err := bucket.NextSequence()
+		if err != nil {
+			return fmt.Errorf("failed to get next sequence: %w", err)
+		}
+
+		// Set the message ID
+		msg.MessageID = int(id)
+
+		// Marshal the message
+		data, err := json.Marshal(msg)
+		if err != nil {
+			return fmt.Errorf("failed to marshal message: %w", err)
+		}
+
+		// Store it in the database
+		if err := bucket.Put(msg.BID(), data); err != nil {
+			return fmt.Errorf("failed to put message into db: %w", err)
+		}
+
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("failed to create message: %w", err)
+	}
+
+	return &msg, nil
+}
 
 // DeleteMessage removes a message from the database.
-func (c *client) DeleteMessage(context.Context) {}
+func (c *client) DeleteMessage(chatID, messageID int) error {
+	if err := c.db.Update(func(tx *bolt.Tx) error {
+		bucketName := ChatInfo{ID: chatID}.MessageBucketName()
+		bucket := tx.Bucket(bucketName)
+		if bucket == nil {
+			return fmt.Errorf("chat messages bucket not found")
+		}
+
+		if err := bucket.Delete(itob(messageID)); err != nil {
+			return fmt.Errorf("failed to delete message from db: %w", err)
+		}
+
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to delete message: %w", err)
+	}
+
+	return nil
+}
+
+type GraphNode struct {
+	ID    int
+	Type  string
+	Props map[string]string
+}
+
+func (n GraphNode) BID() []byte {
+	return itob(n.ID)
+}
+
+// GetNode retrieves a node by its ID from the graph database.
+func (c *client) GetNode(id int) (*GraphNode, error) {
+	var node *GraphNode
+	if err := c.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(nodeBucket))
+		if bucket == nil {
+			return fmt.Errorf("node bucket not found")
+		}
+
+		data := bucket.Get(itob(id))
+		if data == nil {
+			return fmt.Errorf("node with ID %d not found", id)
+		}
+
+		node = &GraphNode{}
+		if err := json.Unmarshal(data, node); err != nil {
+			return fmt.Errorf("failed to unmarshal node: %w", err)
+		}
+
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("failed to get node: %w", err)
+	}
+
+	return node, nil
+}
 
 // ListNodes retrieves all nodes from the graph database.
-func (c *client) ListNodes(context.Context) {}
+func (c *client) ListNodes(nodeType string) ([]GraphNode, error) {
+	var nodes []GraphNode
+	if err := c.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(nodeBucket))
+		if bucket == nil {
+			return fmt.Errorf("node bucket not found")
+		}
+
+		cursor := bucket.Cursor()
+		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+			var node GraphNode
+			if err := json.Unmarshal(v, &node); err != nil {
+				return fmt.Errorf("failed to unmarshal node: %w", err)
+			}
+
+			// Apply type filter if specified
+			if nodeType != "" && node.Type != nodeType {
+				continue
+			}
+
+			nodes = append(nodes, node)
+		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("failed to list nodes: %w", err)
+	}
+	return nodes, nil
+}
 
 // CreateNode adds a new node to the graph database.
-func (c *client) CreateNode(context.Context) {}
+func (c *client) CreateNode(nodeType string, props map[string]string) (*GraphNode, error) {
+	var node *GraphNode
+	if err := c.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(nodeBucket))
+		if bucket == nil {
+			return fmt.Errorf("node bucket not found")
+		}
+
+		// Get next sequence for node ID
+		id, err := bucket.NextSequence()
+		if err != nil {
+			return fmt.Errorf("failed to get next sequence: %w", err)
+		}
+
+		// Create the node
+		node = &GraphNode{
+			ID:    int(id),
+			Type:  nodeType,
+			Props: props,
+		}
+
+		// Marshal the node
+		data, err := json.Marshal(node)
+		if err != nil {
+			return fmt.Errorf("failed to marshal node: %w", err)
+		}
+
+		// Store it in the database
+		if err := bucket.Put(node.BID(), data); err != nil {
+			return fmt.Errorf("failed to put node into db: %w", err)
+		}
+
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("failed to create node: %w", err)
+	}
+
+	return node, nil
+}
 
 // DeleteNode removes a node from the graph database.
-func (c *client) DeleteNode(context.Context) {}
+func (c *client) DeleteNode(id int) error {
+	if err := c.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(nodeBucket))
+		if bucket == nil {
+			return fmt.Errorf("node bucket not found")
+		}
+
+		if err := bucket.Delete(itob(id)); err != nil {
+			return fmt.Errorf("failed to delete node from db: %w", err)
+		}
+
+		// Also delete any related edges
+		edgeBucket := tx.Bucket([]byte(edgeBucket))
+		if edgeBucket == nil {
+			return fmt.Errorf("edge bucket not found")
+		}
+
+		// Iterate through all edges and delete those connected to this node
+		cursor := edgeBucket.Cursor()
+		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+			var edge GraphEdge
+			if err := json.Unmarshal(v, &edge); err != nil {
+				return fmt.Errorf("failed to unmarshal edge: %w", err)
+			}
+
+			if edge.FromID == id || edge.ToID == id {
+				if err := edgeBucket.Delete(k); err != nil {
+					return fmt.Errorf("failed to delete related edge: %w", err)
+				}
+			}
+		}
+
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to delete node: %w", err)
+	}
+
+	return nil
+}
+
+type GraphEdge struct {
+	ID     int
+	Type   string
+	FromID int
+	ToID   int
+}
+
+func (e GraphEdge) BID() []byte {
+	return itob(e.ID)
+}
+
+// EdgeFilter provides criteria for filtering edges in ListEdges.
+type EdgeFilter struct {
+	Type   string // Filter by edge type (if not empty)
+	FromID int    // Filter by source node ID (if not 0)
+	ToID   int    // Filter by target node ID (if not 0)
+}
+
+// GetEdge retrieves an edge by its ID from the graph database.
+func (c *client) GetEdge(id int) (*GraphEdge, error) {
+	var edge *GraphEdge
+	if err := c.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(edgeBucket))
+		if bucket == nil {
+			return fmt.Errorf("edge bucket not found")
+		}
+
+		data := bucket.Get(itob(id))
+		if data == nil {
+			return fmt.Errorf("edge with ID %d not found", id)
+		}
+
+		edge = &GraphEdge{}
+		if err := json.Unmarshal(data, edge); err != nil {
+			return fmt.Errorf("failed to unmarshal edge: %w", err)
+		}
+
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("failed to get edge: %w", err)
+	}
+
+	return edge, nil
+}
 
 // ListEdges retrieves all edges from the graph database.
-func (c *client) ListEdges(context.Context) {}
+func (c *client) ListEdges(filter EdgeFilter) ([]GraphEdge, error) {
+	var edges []GraphEdge
+	if err := c.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(edgeBucket))
+		if bucket == nil {
+			return fmt.Errorf("edge bucket not found")
+		}
+
+		cursor := bucket.Cursor()
+		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+			var edge GraphEdge
+			if err := json.Unmarshal(v, &edge); err != nil {
+				return fmt.Errorf("failed to unmarshal edge: %w", err)
+			}
+
+			// Apply filters if specified
+			if filter.Type != "" && edge.Type != filter.Type {
+				continue
+			}
+			if filter.FromID != 0 && edge.FromID != filter.FromID {
+				continue
+			}
+			if filter.ToID != 0 && edge.ToID != filter.ToID {
+				continue
+			}
+
+			edges = append(edges, edge)
+		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("failed to list edges: %w", err)
+	}
+	return edges, nil
+}
 
 // CreateEdge adds a new edge to the graph database.
-func (c *client) CreateEdge(context.Context) {}
+func (c *client) CreateEdge(edgeType string, fromID, toID int) (*GraphEdge, error) {
+	var edge *GraphEdge
+	if err := c.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(edgeBucket))
+		if bucket == nil {
+			return fmt.Errorf("edge bucket not found")
+		}
+
+		// Check if the nodes exist
+		nodeBucket := tx.Bucket([]byte(nodeBucket))
+		if nodeBucket == nil {
+			return fmt.Errorf("node bucket not found")
+		}
+
+		if nodeBucket.Get(itob(fromID)) == nil {
+			return fmt.Errorf("source node not found")
+		}
+
+		if nodeBucket.Get(itob(toID)) == nil {
+			return fmt.Errorf("target node not found")
+		}
+
+		// Get next sequence for edge ID
+		id, err := bucket.NextSequence()
+		if err != nil {
+			return fmt.Errorf("failed to get next sequence: %w", err)
+		}
+
+		// Create the edge
+		edge = &GraphEdge{
+			ID:     int(id),
+			Type:   edgeType,
+			FromID: fromID,
+			ToID:   toID,
+		}
+
+		// Marshal the edge
+		data, err := json.Marshal(edge)
+		if err != nil {
+			return fmt.Errorf("failed to marshal edge: %w", err)
+		}
+
+		// Store it in the database
+		if err := bucket.Put(edge.BID(), data); err != nil {
+			return fmt.Errorf("failed to put edge into db: %w", err)
+		}
+
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("failed to create edge: %w", err)
+	}
+
+	return edge, nil
+}
 
 // DeleteEdge removes an edge from the graph database.
-func (c *client) DeleteEdge(context.Context) {}
+func (c *client) DeleteEdge(id int) error {
+	if err := c.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(edgeBucket))
+		if bucket == nil {
+			return fmt.Errorf("edge bucket not found")
+		}
+
+		if err := bucket.Delete(itob(id)); err != nil {
+			return fmt.Errorf("failed to delete edge from db: %w", err)
+		}
+
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to delete edge: %w", err)
+	}
+
+	return nil
+}
 
 func itob(i int) []byte {
 	b := make([]byte, 8)
