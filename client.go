@@ -16,6 +16,10 @@ const (
 	schemaVersion = "v1"
 	metaBucket    = "__meta"
 	versionKey    = "version"
+	chatBucket    = "chats"
+	messageBucket = "messages"
+	nodeBucket    = "graph:nodes"
+	edgeBucket    = "graph:edges"
 )
 
 // client manages state
@@ -25,9 +29,9 @@ type client struct {
 	ol  *ollama.Client
 }
 
-func newClient(ctx context.Context, hd string) (*client, error) {
+func newClient(ctx context.Context, d string) (*client, error) {
 	// Format the config dir
-	p := path.Join(hd, confDir)
+	p := path.Join(d, confDir)
 
 	// Make the config directory if it doesn't exist
 	if err := os.MkdirAll(p, 0755); err != nil {
@@ -53,14 +57,33 @@ func newClient(ctx context.Context, hd string) (*client, error) {
 		}
 
 		// Get the current version
-		v := b.Get([]byte(versionKey))
-
-		switch string(v) {
+		switch v := b.Get([]byte(versionKey)); string(v) {
 		case "":
 			// Not set? Initialize the database
 			if err := b.Put([]byte(versionKey), []byte(versionKey)); err != nil {
 				return fmt.Errorf("failed to set version key: %w", err)
 			}
+
+			// Create the chat bucket
+			if _, err := tx.CreateBucket([]byte(chatBucket)); err != nil {
+				return fmt.Errorf("failed to create meta bucket: %w", err)
+			}
+
+			// Create the message bucket
+			if _, err := tx.CreateBucket([]byte(messageBucket)); err != nil {
+				return fmt.Errorf("failed to create message bucket: %w", err)
+			}
+
+			// Create the node bucket
+			if _, err := tx.CreateBucket([]byte(nodeBucket)); err != nil {
+				return fmt.Errorf("failed to create graph node bucket: %w", err)
+			}
+
+			// Create the edge bucket
+			if _, err := tx.CreateBucket([]byte(edgeBucket)); err != nil {
+				return fmt.Errorf("failed to create graph edge bucket: %w", err)
+			}
+
 			return nil
 
 		case versionKey:
@@ -86,6 +109,9 @@ func newClient(ctx context.Context, hd string) (*client, error) {
 		return nil, fmt.Errorf("ollama is not running: %w", err)
 	}
 
+	// TODO: Set up channels?
+	// ...
+
 	// Return the client
 	return &client{
 		dbp: p,
@@ -93,3 +119,35 @@ func newClient(ctx context.Context, hd string) (*client, error) {
 		ol:  c,
 	}, nil
 }
+
+func (c *client) Close() error {
+	if err := c.db.Close(); err != nil {
+		return fmt.Errorf("failed to close database: %w", err)
+	}
+
+	return nil
+}
+
+func (c *client) ListChats(context.Context) {}
+
+func (c *client) CreateChat(context.Context) {}
+
+func (c *client) DeleteChat(context.Context) {}
+
+func (c *client) ListMessages(context.Context) {}
+
+func (c *client) SendMessage(context.Context) {}
+
+func (c *client) DeleteMessage(context.Context) {}
+
+func (c *client) ListNodes(context.Context) {}
+
+func (c *client) CreateNode(context.Context) {}
+
+func (c *client) DeleteNode(context.Context) {}
+
+func (c *client) ListEdges(context.Context) {}
+
+func (c *client) CreateEdge(context.Context) {}
+
+func (c *client) DeleteEdge(context.Context) {}
