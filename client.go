@@ -211,10 +211,11 @@ type Message struct {
 		Text string // The text the agent sent
 	}
 	ToolMsg *struct {
-		ToolName   string // Name of the tool called
-		ToolArgs   string // The arguments passed to the tool
-		ToolResult string // The result of the tool call
-		ToolError  string // The error message if the tool call failed
+		ToolDone   bool
+		ToolName   string         // Name of the tool called
+		ToolArgs   map[string]any // The arguments passed to the tool
+		ToolResult string         // The result of the tool call
+		ToolError  string         // The error message if the tool call failed
 	}
 }
 
@@ -284,6 +285,56 @@ func (c *client) CreateMessage(msg Message) (*Message, error) {
 	return &msg, nil
 }
 
+func (c *client) GetMessage(cid, mid int) (*Message, error) {
+	var msg Message
+	if err := c.db.View(func(tx *bolt.Tx) error {
+		bucketName := ChatInfo{ID: cid}.MessageBucketName()
+		bucket := tx.Bucket(bucketName)
+		if bucket == nil {
+			return fmt.Errorf("chat messages bucket not found")
+		}
+
+		data := bucket.Get(itob(mid))
+		if data == nil {
+			return fmt.Errorf("message not found")
+		}
+
+		if err := json.Unmarshal(data, &msg); err != nil {
+			return fmt.Errorf("failed to unmarshal message: %w", err)
+		}
+
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("failed to get message: %w", err)
+	}
+	return &msg, nil
+}
+
+func (c *client) UpdateMessage(msg Message) error {
+	if err := c.db.Update(func(tx *bolt.Tx) error {
+		bucketName := ChatInfo{ID: msg.ChatID}.MessageBucketName()
+		bucket := tx.Bucket(bucketName)
+		if bucket == nil {
+			return fmt.Errorf("chat messages bucket not found")
+		}
+
+		data, err := json.Marshal(msg)
+		if err != nil {
+			return fmt.Errorf("failed to marshal message: %w", err)
+		}
+
+		if err := bucket.Put(itob(msg.MessageID), data); err != nil {
+			return fmt.Errorf("failed to put message into db: %w", err)
+		}
+
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to update message: %w", err)
+	}
+
+	return nil
+}
+
 // DeleteMessage removes a message from the database.
 func (c *client) DeleteMessage(chatID, messageID int) error {
 	if err := c.db.Update(func(tx *bolt.Tx) error {
@@ -308,7 +359,7 @@ func (c *client) DeleteMessage(chatID, messageID int) error {
 type GraphNode struct {
 	ID    int
 	Type  string
-	Props map[string]string
+	Props map[string]any
 }
 
 func (n GraphNode) BID() []byte {
@@ -373,7 +424,7 @@ func (c *client) ListNodes(nodeType string) ([]GraphNode, error) {
 }
 
 // CreateNode adds a new node to the graph database.
-func (c *client) CreateNode(nodeType string, props map[string]string) (*GraphNode, error) {
+func (c *client) CreateNode(nodeType string, props map[string]any) (*GraphNode, error) {
 	var node *GraphNode
 	if err := c.db.Update(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket([]byte(nodeBucket))
