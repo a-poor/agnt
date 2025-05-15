@@ -21,7 +21,6 @@ const (
 	messageBucket = "messages"
 	nodeBucket    = "graph:nodes"
 	edgeBucket    = "graph:edges"
-	defaultModel  = "qwen3"
 )
 
 // client manages state
