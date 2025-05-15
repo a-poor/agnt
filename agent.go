@@ -46,15 +46,16 @@ func (a *agent) getChatHistory(cid int) ([]ollama.Message, error) {
 	return hs, nil
 }
 
-func (a *agent) generate(ctx context.Context, cid int) error {
+func (a *agent) generate(ctx context.Context, cid int) (*Message, error) {
 	// Get the previous messages from the conversation
 	h, err := a.getChatHistory(cid)
 	if err != nil {
-		return fmt.Errorf("failed to get messages: %w", err)
+		return nil, fmt.Errorf("failed to get messages: %w", err)
 	}
 
 	// Generate a response using ollama
-	var stream bool
+	var msg Message
+	stream := false
 	if err := a.ol.Chat(ctx, &ollama.ChatRequest{
 		Model:    defaultModel,
 		Messages: h,
@@ -72,15 +73,14 @@ func (a *agent) generate(ctx context.Context, cid int) error {
 		},
 	}, func(resp ollama.ChatResponse) error {
 		// TODO: Finish filling this in...
+
+		if resp.Message.Role == "tool" {
+			msg.C
+		}
+
 		return nil
 	}); err != nil {
-		return fmt.Errorf("failed to generate response: %w", err)
+		return nil, fmt.Errorf("failed to generate response: %w", err)
 	}
-
-	// Send the response to the client
-	if err := a.c.sendMessage(ctx, cid, resp.Text); err != nil {
-		return fmt.Errorf("failed to send message: %w", err)
-	}
-
-	return nil
+	return &msg, nil
 }

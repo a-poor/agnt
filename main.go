@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 
 	ollama "github.com/ollama/ollama/api"
 )
@@ -171,12 +172,9 @@ func main() {
 		panic(err)
 	}
 
-	// // Make the CLI app
-	// app := makeApp()
-
-	// // Run it
-	// if err := app.Run(ctx, os.Args); err != nil {
-	// 	panic(err)
-	// }
+	// Run it
+	if err := makeApp().Run(ctx, os.Args); err != nil {
+		panic(err)
+	}
 
 }
