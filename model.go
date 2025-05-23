@@ -133,6 +133,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.ta.Blur()
 		}
 	case SendMessageMsg:
+		// Check if chat is already running
+		chat, err := m.c.GetChat(m.chatId)
+		if err != nil {
+			panic(err)
+		}
+		if chat.State == "running" {
+			// Ignore message if chat is already generating
+			return m, nil
+		}
+		
 		// Add the message to the database
 		if _, err := m.c.CreateMessage(Message{
 			ChatID:  m.chatId,
@@ -148,17 +158,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			func() tea.Msg { return SetFocusMsg{focus: "textarea"} },
 		)
 	case GenerateMsg:
-		// // TODO – Fill this in...
-		// m.a.gc <- struct{ cid int }{cid: 1}
-		// return m, nil
-
-		if _, err := m.a.generate(m.ctx, m.chatId, func() {}); err != nil {
-			panic(err)
-		}
-		return m, tea.Batch(func() tea.Msg { return UpdateChatMsg{} })
+		// Send generation request through channel
+		m.a.gc <- GenerateRequest{ChatID: m.chatId}
+		return m, nil
 	case UpdateChatMsg:
 		// Get the history for the chat and store it
-		hist, err := m.c.ListMessages(1)
+		hist, err := m.c.ListMessages(m.chatId)
 		if err != nil {
 			panic(err)
 		}
@@ -172,6 +177,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(func() tea.Msg { return GenerateMsg{} })
 		}
 		return m, nil
+	case GenerateResponse:
+		if msg.Error != nil {
+			// TODO: Handle error more gracefully
+			panic(msg.Error)
+		}
+		// Refresh the chat to show the completed response
+		return m, func() tea.Msg { return UpdateChatMsg{} }
 	}
 	return m, nil
 }

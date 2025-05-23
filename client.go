@@ -112,8 +112,9 @@ func (c *client) Close() error {
 }
 
 type ChatInfo struct {
-	ID   int
-	Name string
+	ID    int
+	Name  string
+	State string // "idle" or "running"
 }
 
 func (ci ChatInfo) BID() []byte {
@@ -155,8 +156,9 @@ func (c *client) CreateChat(n string) (*ChatInfo, error) {
 
 		// Define the new object and marshall it
 		ci = &ChatInfo{
-			ID:   int(id),
-			Name: n,
+			ID:    int(id),
+			Name:  n,
+			State: "idle",
 		}
 		by, err := json.Marshal(ci)
 		if err != nil {
@@ -198,6 +200,67 @@ func (c *client) DeleteChat(id int) error {
 		return fmt.Errorf("failed to delete chat from db: %w", err)
 	}
 	return nil
+}
+
+// UpdateChatState updates the state of a chat thread ("idle" or "running").
+func (c *client) UpdateChatState(chatID int, state string) error {
+	if state != "idle" && state != "running" {
+		return fmt.Errorf("invalid state: %s (must be 'idle' or 'running')", state)
+	}
+	
+	return c.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(chatBucket))
+		
+		// Get existing chat
+		v := b.Get(itob(chatID))
+		if v == nil {
+			return fmt.Errorf("chat not found: %d", chatID)
+		}
+		
+		// Unmarshal existing chat
+		var ci ChatInfo
+		if err := json.Unmarshal(v, &ci); err != nil {
+			return fmt.Errorf("failed to unmarshal chat info: %w", err)
+		}
+		
+		// Update state
+		ci.State = state
+		
+		// Marshal and save back
+		by, err := json.Marshal(ci)
+		if err != nil {
+			return fmt.Errorf("failed to marshal chat info: %w", err)
+		}
+		
+		if err := b.Put(ci.BID(), by); err != nil {
+			return fmt.Errorf("failed to update chat in db: %w", err)
+		}
+		
+		return nil
+	})
+}
+
+// GetChat retrieves a single chat by ID.
+func (c *client) GetChat(chatID int) (*ChatInfo, error) {
+	var ci *ChatInfo
+	err := c.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(chatBucket))
+		v := b.Get(itob(chatID))
+		if v == nil {
+			return fmt.Errorf("chat not found: %d", chatID)
+		}
+		
+		var chat ChatInfo
+		if err := json.Unmarshal(v, &chat); err != nil {
+			return fmt.Errorf("failed to unmarshal chat info: %w", err)
+		}
+		ci = &chat
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ci, nil
 }
 
 type Message struct {

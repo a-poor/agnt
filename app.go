@@ -57,28 +57,44 @@ func makeApp() *cli.Command {
 			m := newModel(ctx, client, agent)
 			p := tea.NewProgram(m, tea.WithAltScreen())
 
-			// TODO: Run the agent queue
+			// Run the agent worker goroutine
 			go func() {
-				select {
-				case <-ctx.Done():
-					// Quit the TUI
-					p.Quit()
+				for {
+					select {
+					case <-ctx.Done():
+						// Quit the TUI
+						p.Quit()
 
-					// Shut down the client
-					if err := client.Close(); err != nil {
-						panic(err)
-					}
-				case g := <-agent.gc:
-					// Run the generation without blocking...
-					fmt.Fprintln(os.Stderr, "Got generate msg in channel")
-					if _, err := agent.generate(ctx, g.cid, func() {}); err != nil {
-						panic(err)
-					}
-					fmt.Fprintln(os.Stderr, "Completed generate msg in channel")
+						// Shut down the client
+						if err := client.Close(); err != nil {
+							panic(err)
+						}
+						return
+					case req := <-agent.gc:
+						// Update chat state to running
+						if err := client.UpdateChatState(req.ChatID, "running"); err != nil {
+							p.Send(GenerateResponse{ChatID: req.ChatID, Error: err})
+							continue
+						}
 
-					// Then tell the TUI to update
-					m.Update(UpdateChatMsg{})
-					fmt.Fprintln(os.Stderr, "Sent refresh msg")
+						// Run the generation
+						fmt.Fprintln(os.Stderr, "Got generate request for chat", req.ChatID)
+						_, err := agent.generate(ctx, req.ChatID, func() {
+							// Send intermediate update
+							p.Send(UpdateChatMsg{})
+						})
+						
+						// Update chat state back to idle
+						if stateErr := client.UpdateChatState(req.ChatID, "idle"); stateErr != nil {
+							if err == nil {
+								err = stateErr
+							}
+						}
+
+						// Send completion response
+						p.Send(GenerateResponse{ChatID: req.ChatID, Error: err})
+						fmt.Fprintln(os.Stderr, "Completed generate for chat", req.ChatID)
+					}
 				}
 			}()
 

@@ -6,74 +6,101 @@ import (
 	"fmt"
 	"os"
 
-	ollama "github.com/ollama/ollama/api"
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
 )
 
-const defaultModel = "qwen3"
+const defaultModel = "claude-3-5-sonnet-20241022"
+
+type GenerateRequest struct {
+	ChatID int
+}
+
+type GenerateResponse struct {
+	ChatID int
+	Error  error
+}
 
 type agent struct {
-	ol *ollama.Client
+	ac *anthropic.Client
 	c  *client
-	gc chan struct{ cid int }
+	gc chan GenerateRequest
 }
 
 func newAgent(ctx context.Context, c *client) (*agent, error) {
-	// Connect to the ollama client
-	ol, err := ollama.ClientFromEnvironment()
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to ollama: %w", err)
+	// Get API key from environment
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	if apiKey == "" {
+		return nil, fmt.Errorf("ANTHROPIC_API_KEY environment variable not set")
 	}
 
-	// Check that ollama is running
-	if err := ol.Heartbeat(ctx); err != nil {
-		return nil, fmt.Errorf("ollama is not running: %w", err)
-	}
+	// Create anthropic client
+	ac := anthropic.NewClient(option.WithAPIKey(apiKey))
+	
 	return &agent{
-		ol: ol,
+		ac: ac,
 		c:  c,
-		gc: make(chan struct{ cid int }),
+		gc: make(chan GenerateRequest),
 	}, nil
 }
 
-func (a *agent) getChatHistory(cid int) ([]ollama.Message, error) {
+func (a *agent) getChatHistory(cid int) ([]anthropic.MessageParam, error) {
 	// Get the messages in the chat
 	ms, err := a.c.ListMessages(cid)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list messages: %w", err)
 	}
 
-	// Convert them to ollama messages
-	var hs []ollama.Message
+	// Convert them to anthropic messages
+	var hs []anthropic.MessageParam
+	var pendingToolUseID string
+	
 	for _, m := range ms {
 		switch m.MType {
 		case "user":
-			hs = append(hs, ollama.Message{
-				Role:    "user",
-				Content: m.UserMsg.Text,
-			})
+			hs = append(hs, anthropic.NewUserMessage(anthropic.NewTextBlock(m.UserMsg.Text)))
 		case "agent":
-			hs = append(hs, ollama.Message{
-				Role:    "assistant",
-				Content: m.AgentMsg.Text,
-			})
+			hs = append(hs, anthropic.NewAssistantMessage(anthropic.NewTextBlock(m.AgentMsg.Text)))
 		case "tool":
-			// NOTE: Tool calls internally are one message
-			// but to ollama they're two – the agent's call
-			// and the tool's response.
-			hs = append(hs, ollama.Message{
-				Role: "assistant",
-				ToolCalls: []ollama.ToolCall{
-					{Function: ollama.ToolCallFunction{
-						Index:     0, // TODO: Change this?
-						Name:      m.ToolMsg.ToolName,
-						Arguments: m.ToolMsg.ToolArgs,
-					}},
-				},
-			})
-			hs = append(hs, ollama.Message{
-				Role:    "tool",
-				Content: m.ToolMsg.ToolResult,
-			})
+			// For tool calls, we need to reconstruct the assistant message with tool use
+			// and then add the tool result
+			toolUseID := fmt.Sprintf("tool_%d", m.MessageID)
+			pendingToolUseID = toolUseID
+			
+			// Convert tool args to JSON
+			inputJSON, err := json.Marshal(m.ToolMsg.ToolArgs)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal tool args: %w", err)
+			}
+			
+			toolUse := anthropic.ToolUseBlock{
+				Type: anthropic.ContentBlockTypeToolUse,
+				ID:   toolUseID,
+				Name: m.ToolMsg.ToolName,
+				Input: json.RawMessage(inputJSON),
+			}
+			hs = append(hs, anthropic.NewAssistantMessage(toolUse))
+			
+			// Add tool result if we have one
+			if m.ToolMsg.ToolError != "" || m.ToolMsg.ToolResult != "" {
+				var resultContent string
+				isError := false
+				
+				if m.ToolMsg.ToolError != "" {
+					resultContent = m.ToolMsg.ToolError
+					isError = true
+				} else {
+					resultContent = m.ToolMsg.ToolResult
+				}
+				
+				toolResult := anthropic.ToolResultBlock{
+					Type:      anthropic.ContentBlockTypeToolResult,
+					ToolUseID: pendingToolUseID,
+					IsError:   isError,
+					Content:   resultContent,
+				}
+				hs = append(hs, anthropic.NewUserMessage(toolResult))
+			}
 		default:
 			return nil, fmt.Errorf("unknown message type %q", m.MType)
 		}
@@ -88,357 +115,229 @@ func (a *agent) generate(ctx context.Context, cid int, onupdate func()) (*Messag
 		return nil, fmt.Errorf("failed to get messages: %w", err)
 	}
 
-	// Generate a response using ollama
+	// Create the request
+	req := anthropic.MessageNewParams{
+		Model:     ptr(defaultModel),
+		Messages:  h,
+		MaxTokens: ptr(int64(4096)),
+		Tools:     a.getTools(),
+	}
+
+	// Generate a response using anthropic
+	resp, err := a.ac.Messages.New(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate response: %w", err)
+	}
+
+	// Process the response
 	var m *Message
-	if err := a.ol.Chat(ctx, &ollama.ChatRequest{
-		Model:    defaultModel,
-		Messages: h,
-		Stream:   new(bool), // Always false
-		Tools:    a.getTools(),
-	}, func(resp ollama.ChatResponse) error {
-		// Trigger when done
-		defer onupdate()
-
-		// Has the message already been created? Then update it.
-		if m != nil && m.MType == "agent" {
-			m.AgentMsg.Text += resp.Message.Content
-			return a.c.UpdateMessage(*m)
+	
+	// Check if the response contains tool use
+	var hasToolUse bool
+	var toolUseBlock *anthropic.ToolUseBlock
+	var textContent string
+	
+	for _, content := range resp.Content {
+		switch content.Type {
+		case anthropic.ContentBlockTypeText:
+			if textBlock, ok := content.AsUnion().(anthropic.TextBlock); ok {
+				textContent += textBlock.Text
+			}
+		case anthropic.ContentBlockTypeToolUse:
+			if toolBlock, ok := content.AsUnion().(anthropic.ToolUseBlock); ok {
+				hasToolUse = true
+				toolUseBlock = &toolBlock
+			}
 		}
-		if m != nil && m.MType == "tool" {
-			fmt.Fprintf(os.Stderr, "Getting tool call update: %#v\n", resp)
-			// m.ToolMsg.ToolName += resp.Message.Content
-			// return a.c.UpdateMessage(*m)
-		}
+	}
 
-		// Create a message based on the response
+	if hasToolUse && toolUseBlock != nil {
+		// Convert JSON input to map
+		var toolArgs map[string]any
+		if err := json.Unmarshal(toolUseBlock.Input, &toolArgs); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal tool args: %w", err)
+		}
+		
+		// Create tool message
 		m = &Message{
 			ChatID: cid,
-			// MessageID: 0, // Intentionally not set
-			MType: "agent",
-			AgentMsg: &struct{ Text string }{
-				Text: resp.Message.Content,
-			},
-		}
-		if len(resp.Message.ToolCalls) > 0 {
-			fmt.Fprintln(os.Stderr, "Creating tool call: "+resp.Message.ToolCalls[0].Function.Name)
-			m.MType = "tool"
-			m.ToolMsg = &struct {
+			MType:  "tool",
+			ToolMsg: &struct {
 				ToolDone   bool
 				ToolName   string
 				ToolArgs   map[string]any
 				ToolResult string
 				ToolError  string
 			}{
-				ToolDone: resp.Done,
-				ToolName: resp.Message.ToolCalls[0].Function.Name,
-				ToolArgs: resp.Message.ToolCalls[0].Function.Arguments,
-			}
+				ToolDone: false,
+				ToolName: toolUseBlock.Name,
+				ToolArgs: toolArgs,
+			},
 		}
-
-		// Create the message
-		msg, err := a.c.CreateMessage(*m)
-		if err != nil {
-			return fmt.Errorf("failed to create message: %w", err)
+	} else {
+		// Create agent message
+		m = &Message{
+			ChatID: cid,
+			MType:  "agent",
+			AgentMsg: &struct{ Text string }{
+				Text: textContent,
+			},
 		}
-		m = msg
-		return nil
-	}); err != nil {
-		return nil, fmt.Errorf("failed to generate response: %w", err)
 	}
 
-	// Handle the tool call
-	if m.MType == "tool" && m.ToolMsg.ToolDone {
+	// Create the message in the database
+	msg, err := a.c.CreateMessage(*m)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create message: %w", err)
+	}
+	m = msg
+
+	// Trigger update
+	defer onupdate()
+
+	// Handle the tool call if needed
+	if m.MType == "tool" {
 		fmt.Fprintln(os.Stderr, "Calling the tool")
 		// NOTE: This will update the message in the client
 		if err := a.handleToolCall(m); err != nil {
 			return nil, fmt.Errorf("failed to handle tool call: %w", err)
 		}
+		m.ToolMsg.ToolDone = true
 	}
+	
 	return m, nil
 }
 
-func (a *agent) getTools() []ollama.Tool {
-	return []ollama.Tool{
+func (a *agent) getTools() []anthropic.ToolParam {
+	return []anthropic.ToolParam{
 		{
-			Type: "function",
-			Function: ollama.ToolFunction{
-				Name:        "get_node",
-				Description: "Retrieves a single graph node by its ID. Returns the node's ID, type, and properties.",
-				Parameters: struct {
-					Type       string   `json:"type"`
-					Defs       any      `json:"$defs,omitempty"`
-					Items      any      `json:"items,omitempty"`
-					Required   []string `json:"required"`
-					Properties map[string]struct {
-						Type        ollama.PropertyType `json:"type"`
-						Items       any                 `json:"items,omitempty"`
-						Description string              `json:"description"`
-						Enum        []any               `json:"enum,omitempty"`
-					} `json:"properties"`
-				}{
-					Type:     "object",
-					Required: []string{"id"},
-					Properties: map[string]struct {
-						Type        ollama.PropertyType `json:"type"`
-						Items       any                 `json:"items,omitempty"`
-						Description string              `json:"description"`
-						Enum        []any               `json:"enum,omitempty"`
-					}{
-						"id": {
-							Type:        []string{"integer"},
-							Description: "The unique identifier of the node to retrieve.",
-						},
+			Name:        "get_node",
+			Description: ptr("Retrieves a single graph node by its ID. Returns the node's ID, type, and properties."),
+			InputSchema: anthropic.ToolInputSchemaParam{
+				Type: anthropic.ToolInputSchemaTypeObject,
+				Properties: map[string]interface{}{
+					"id": map[string]interface{}{
+						"type":        "integer",
+						"description": "The unique identifier of the node to retrieve.",
+					},
+				},
+				Required: []string{"id"},
+			},
+		},
+		{
+			Name:        "list_nodes",
+			Description: ptr("Lists all graph nodes of a specific type. If no type is provided, returns all nodes."),
+			InputSchema: anthropic.ToolInputSchemaParam{
+				Type: anthropic.ToolInputSchemaTypeObject,
+				Properties: map[string]interface{}{
+					"node_type": map[string]interface{}{
+						"type":        "string",
+						"description": "The type of nodes to list. If empty, all nodes will be returned.",
 					},
 				},
 			},
 		},
 		{
-			Type: "function",
-			Function: ollama.ToolFunction{
-				Name:        "list_nodes",
-				Description: "Lists all graph nodes of a specific type. If no type is provided, returns all nodes.",
-				Parameters: struct {
-					Type       string   `json:"type"`
-					Defs       any      `json:"$defs,omitempty"`
-					Items      any      `json:"items,omitempty"`
-					Required   []string `json:"required"`
-					Properties map[string]struct {
-						Type        ollama.PropertyType `json:"type"`
-						Items       any                 `json:"items,omitempty"`
-						Description string              `json:"description"`
-						Enum        []any               `json:"enum,omitempty"`
-					} `json:"properties"`
-				}{
-					Type: "object",
-					Properties: map[string]struct {
-						Type        ollama.PropertyType `json:"type"`
-						Items       any                 `json:"items,omitempty"`
-						Description string              `json:"description"`
-						Enum        []any               `json:"enum,omitempty"`
-					}{
-						"node_type": {
-							Type:        []string{"string"},
-							Description: "The type of nodes to list. If empty, all nodes will be returned.",
-						},
+			Name:        "create_node",
+			Description: ptr("Creates a new graph node with the specified type and properties. Returns the created node with its assigned ID."),
+			InputSchema: anthropic.ToolInputSchemaParam{
+				Type: anthropic.ToolInputSchemaTypeObject,
+				Properties: map[string]interface{}{
+					"type": map[string]interface{}{
+						"type":        "string",
+						"description": "The type of the node to create. For example, 'person', 'document', etc.",
+					},
+					"props": map[string]interface{}{
+						"type":        "object",
+						"description": "A map of properties to store with the node. For example, {\"name\": \"John\", \"age\": 30}.",
+					},
+				},
+				Required: []string{"type"},
+			},
+		},
+		{
+			Name:        "delete_node",
+			Description: ptr("Deletes a graph node by its ID. Note that this will also delete all edges connected to this node."),
+			InputSchema: anthropic.ToolInputSchemaParam{
+				Type: anthropic.ToolInputSchemaTypeObject,
+				Properties: map[string]interface{}{
+					"id": map[string]interface{}{
+						"type":        "integer",
+						"description": "The unique identifier of the node to delete.",
+					},
+				},
+				Required: []string{"id"},
+			},
+		},
+		{
+			Name:        "get_edge",
+			Description: ptr("Retrieves a single graph edge by its ID. Returns the edge's ID, type, and the IDs of its connected nodes."),
+			InputSchema: anthropic.ToolInputSchemaParam{
+				Type: anthropic.ToolInputSchemaTypeObject,
+				Properties: map[string]interface{}{
+					"id": map[string]interface{}{
+						"type":        "integer",
+						"description": "The unique identifier of the edge to retrieve.",
+					},
+				},
+				Required: []string{"id"},
+			},
+		},
+		{
+			Name:        "list_edges",
+			Description: ptr("Lists graph edges based on optional filters. Can filter by edge type, source node ID, and/or target node ID."),
+			InputSchema: anthropic.ToolInputSchemaParam{
+				Type: anthropic.ToolInputSchemaTypeObject,
+				Properties: map[string]interface{}{
+					"type": map[string]interface{}{
+						"type":        "string",
+						"description": "Filter edges by this type. For example, 'knows', 'contains', etc.",
+					},
+					"from_id": map[string]interface{}{
+						"type":        "integer",
+						"description": "Filter edges that originate from this node ID.",
+					},
+					"to_id": map[string]interface{}{
+						"type":        "integer",
+						"description": "Filter edges that point to this node ID.",
 					},
 				},
 			},
 		},
 		{
-			Type: "function",
-			Function: ollama.ToolFunction{
-				Name:        "create_node",
-				Description: "Creates a new graph node with the specified type and properties. Returns the created node with its assigned ID.",
-				Parameters: struct {
-					Type       string   `json:"type"`
-					Defs       any      `json:"$defs,omitempty"`
-					Items      any      `json:"items,omitempty"`
-					Required   []string `json:"required"`
-					Properties map[string]struct {
-						Type        ollama.PropertyType `json:"type"`
-						Items       any                 `json:"items,omitempty"`
-						Description string              `json:"description"`
-						Enum        []any               `json:"enum,omitempty"`
-					} `json:"properties"`
-				}{
-					Type:     "object",
-					Required: []string{"type"},
-					Properties: map[string]struct {
-						Type        ollama.PropertyType `json:"type"`
-						Items       any                 `json:"items,omitempty"`
-						Description string              `json:"description"`
-						Enum        []any               `json:"enum,omitempty"`
-					}{
-						"type": {
-							Type:        []string{"string"},
-							Description: "The type of the node to create. For example, 'person', 'document', etc.",
-						},
-						"props": {
-							Type:        []string{"object"},
-							Description: "A map of properties to store with the node. For example, {\"name\": \"John\", \"age\": 30}.",
-						},
+			Name:        "create_edge",
+			Description: ptr("Creates a new graph edge connecting two nodes. Specify the edge type and the IDs of the source and target nodes."),
+			InputSchema: anthropic.ToolInputSchemaParam{
+				Type: anthropic.ToolInputSchemaTypeObject,
+				Properties: map[string]interface{}{
+					"type": map[string]interface{}{
+						"type":        "string",
+						"description": "The type of the edge to create. For example, 'knows', 'contains', etc.",
+					},
+					"from_id": map[string]interface{}{
+						"type":        "integer",
+						"description": "The ID of the source node where the edge starts.",
+					},
+					"to_id": map[string]interface{}{
+						"type":        "integer",
+						"description": "The ID of the target node where the edge ends.",
 					},
 				},
+				Required: []string{"type", "from_id", "to_id"},
 			},
 		},
 		{
-			Type: "function",
-			Function: ollama.ToolFunction{
-				Name:        "delete_node",
-				Description: "Deletes a graph node by its ID. Note that this will also delete all edges connected to this node.",
-				Parameters: struct {
-					Type       string   `json:"type"`
-					Defs       any      `json:"$defs,omitempty"`
-					Items      any      `json:"items,omitempty"`
-					Required   []string `json:"required"`
-					Properties map[string]struct {
-						Type        ollama.PropertyType `json:"type"`
-						Items       any                 `json:"items,omitempty"`
-						Description string              `json:"description"`
-						Enum        []any               `json:"enum,omitempty"`
-					} `json:"properties"`
-				}{
-					Type:     "object",
-					Required: []string{"id"},
-					Properties: map[string]struct {
-						Type        ollama.PropertyType `json:"type"`
-						Items       any                 `json:"items,omitempty"`
-						Description string              `json:"description"`
-						Enum        []any               `json:"enum,omitempty"`
-					}{
-						"id": {
-							Type:        []string{"integer"},
-							Description: "The unique identifier of the node to delete.",
-						},
+			Name:        "delete_edge",
+			Description: ptr("Deletes a graph edge by its ID."),
+			InputSchema: anthropic.ToolInputSchemaParam{
+				Type: anthropic.ToolInputSchemaTypeObject,
+				Properties: map[string]interface{}{
+					"id": map[string]interface{}{
+						"type":        "integer",
+						"description": "The unique identifier of the edge to delete.",
 					},
 				},
-			},
-		},
-		{
-			Type: "function",
-			Function: ollama.ToolFunction{
-				Name:        "get_edge",
-				Description: "Retrieves a single graph edge by its ID. Returns the edge's ID, type, and the IDs of its connected nodes.",
-				Parameters: struct {
-					Type       string   `json:"type"`
-					Defs       any      `json:"$defs,omitempty"`
-					Items      any      `json:"items,omitempty"`
-					Required   []string `json:"required"`
-					Properties map[string]struct {
-						Type        ollama.PropertyType `json:"type"`
-						Items       any                 `json:"items,omitempty"`
-						Description string              `json:"description"`
-						Enum        []any               `json:"enum,omitempty"`
-					} `json:"properties"`
-				}{
-					Type:     "object",
-					Required: []string{"id"},
-					Properties: map[string]struct {
-						Type        ollama.PropertyType `json:"type"`
-						Items       any                 `json:"items,omitempty"`
-						Description string              `json:"description"`
-						Enum        []any               `json:"enum,omitempty"`
-					}{
-						"id": {
-							Type:        []string{"integer"},
-							Description: "The unique identifier of the edge to retrieve.",
-						},
-					},
-				},
-			},
-		},
-		{
-			Type: "function",
-			Function: ollama.ToolFunction{
-				Name:        "list_edges",
-				Description: "Lists graph edges based on optional filters. Can filter by edge type, source node ID, and/or target node ID.",
-				Parameters: struct {
-					Type       string   `json:"type"`
-					Defs       any      `json:"$defs,omitempty"`
-					Items      any      `json:"items,omitempty"`
-					Required   []string `json:"required"`
-					Properties map[string]struct {
-						Type        ollama.PropertyType `json:"type"`
-						Items       any                 `json:"items,omitempty"`
-						Description string              `json:"description"`
-						Enum        []any               `json:"enum,omitempty"`
-					} `json:"properties"`
-				}{
-					Type: "object",
-					Properties: map[string]struct {
-						Type        ollama.PropertyType `json:"type"`
-						Items       any                 `json:"items,omitempty"`
-						Description string              `json:"description"`
-						Enum        []any               `json:"enum,omitempty"`
-					}{
-						"type": {
-							Type:        []string{"string"},
-							Description: "Filter edges by this type. For example, 'knows', 'contains', etc.",
-						},
-						"from_id": {
-							Type:        []string{"integer"},
-							Description: "Filter edges that originate from this node ID.",
-						},
-						"to_id": {
-							Type:        []string{"integer"},
-							Description: "Filter edges that point to this node ID.",
-						},
-					},
-				},
-			},
-		},
-		{
-			Type: "function",
-			Function: ollama.ToolFunction{
-				Name:        "create_edge",
-				Description: "Creates a new graph edge connecting two nodes. Specify the edge type and the IDs of the source and target nodes.",
-				Parameters: struct {
-					Type       string   `json:"type"`
-					Defs       any      `json:"$defs,omitempty"`
-					Items      any      `json:"items,omitempty"`
-					Required   []string `json:"required"`
-					Properties map[string]struct {
-						Type        ollama.PropertyType `json:"type"`
-						Items       any                 `json:"items,omitempty"`
-						Description string              `json:"description"`
-						Enum        []any               `json:"enum,omitempty"`
-					} `json:"properties"`
-				}{
-					Type:     "object",
-					Required: []string{"type", "from_id", "to_id"},
-					Properties: map[string]struct {
-						Type        ollama.PropertyType `json:"type"`
-						Items       any                 `json:"items,omitempty"`
-						Description string              `json:"description"`
-						Enum        []any               `json:"enum,omitempty"`
-					}{
-						"type": {
-							Type:        []string{"string"},
-							Description: "The type of the edge to create. For example, 'knows', 'contains', etc.",
-						},
-						"from_id": {
-							Type:        []string{"integer"},
-							Description: "The ID of the source node where the edge starts.",
-						},
-						"to_id": {
-							Type:        []string{"integer"},
-							Description: "The ID of the target node where the edge ends.",
-						},
-					},
-				},
-			},
-		},
-		{
-			Type: "function",
-			Function: ollama.ToolFunction{
-				Name:        "delete_edge",
-				Description: "Deletes a graph edge by its ID.",
-				Parameters: struct {
-					Type       string   `json:"type"`
-					Defs       any      `json:"$defs,omitempty"`
-					Items      any      `json:"items,omitempty"`
-					Required   []string `json:"required"`
-					Properties map[string]struct {
-						Type        ollama.PropertyType `json:"type"`
-						Items       any                 `json:"items,omitempty"`
-						Description string              `json:"description"`
-						Enum        []any               `json:"enum,omitempty"`
-					} `json:"properties"`
-				}{
-					Type:     "object",
-					Required: []string{"id"},
-					Properties: map[string]struct {
-						Type        ollama.PropertyType `json:"type"`
-						Items       any                 `json:"items,omitempty"`
-						Description string              `json:"description"`
-						Enum        []any               `json:"enum,omitempty"`
-					}{
-						"id": {
-							Type:        []string{"integer"},
-							Description: "The unique identifier of the edge to delete.",
-						},
-					},
-				},
+				Required: []string{"id"},
 			},
 		},
 	}
@@ -550,4 +449,9 @@ func (a *agent) handleToolCall(m *Message) error {
 
 	m.ToolMsg.ToolResult = string(jsonResult)
 	return a.c.UpdateMessage(*m)
+}
+
+// Generic helper function to create a pointer
+func ptr[T any](v T) *T {
+	return &v
 }
